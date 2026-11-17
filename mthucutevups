@@ -1,0 +1,1086 @@
+local Players = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local VirtualInputManager = game:GetService("VirtualInputManager")
+local VirtualUser = game:GetService("VirtualUser")
+local RunService = game:GetService("RunService")
+local TeleportService = game:GetService("TeleportService")
+local HttpService = game:GetService("HttpService")
+local CoreGui = game:GetService("CoreGui")
+local Lighting = game:GetService("Lighting")
+
+local LocalPlayer = Players.LocalPlayer
+
+local Rayfield = loadstring(game:HttpGet("https://sirius.menu/rayfield"))()
+
+local CONFIG = {
+	HoldTime = 6,
+	Range = 200,
+	Cooldown = 1,
+	BlacklistTime = 45,
+	VoidY = -200,
+	StandOff = 2.5,
+	TravelSpeed = 45,
+	ArcHeight = 8,
+	ShortDistance = 12,
+	ArriveWait = 0.3,
+	MaxStuckFrames = 10,
+	AntiAFKInterval = 40,
+	CamDistance = 7,
+	CamMinDistance = 0.6,
+	CamHeight = 1.2,
+	MenuKey = Enum.KeyCode.X,
+	SafeRange = 60,
+	IgnoreFriends = true,
+	HopHealth = 0.35,
+	MaxServerPlayers = 6,
+}
+
+local state = {
+	running = false,
+	holdingE = false,
+	menuVisible = true,
+	antiAFK = true,
+	idleConn = nil,
+	origMinZoom = nil,
+	camLocked = false,
+	focusPos = nil,
+	autoHop = true,
+	invisible = false,
+	hopping = false,
+	fpsBoosted = true,
+	showRange = false,
+	antiToyBox = true, 
+	blacklist = setmetatable({}, { __mode = "k" }),
+}
+
+local CAM_BIND = "AutoFarmCameraLock"
+local visitedServers = {}
+local farmToggle = nil
+local rangeVisualPart = nil
+local rangeColor = Color3.fromRGB(0, 255, 255)
+
+local function getCharacterParts()
+	local char = LocalPlayer.Character
+	if not char then
+		return nil, nil
+	end
+	local root = char:FindFirstChild("HumanoidRootPart")
+	local hum = char:FindFirstChildOfClass("Humanoid")
+	return root, hum
+end
+
+local function resolvePart(prompt)
+	local parent = prompt.Parent
+	if not parent then
+		return nil
+	end
+	if parent:IsA("BasePart") then
+		return parent
+	end
+	if parent:IsA("Attachment") then
+		local p = parent.Parent
+		if p and p:IsA("BasePart") then
+			return p
+		end
+		return nil
+	end
+	if parent:IsA("Model") then
+		if parent.PrimaryPart then
+			return parent.PrimaryPart
+		end
+		return parent:FindFirstChildWhichIsA("BasePart", true)
+	end
+	return parent:FindFirstAncestorWhichIsA("BasePart") or parent:FindFirstChildWhichIsA("BasePart", true)
+end
+
+local function getActivationRange(prompt)
+	local maxDist = prompt.MaxActivationDistance
+	if not maxDist or maxDist <= 0 then
+		maxDist = 10
+	end
+	return math.max(maxDist, 6)
+end
+
+-- Kiểm tra xem ProximityPrompt có phải là Toy Box Pack không
+local function isToyBoxPack(prompt)
+	if not state.antiToyBox then
+		return false
+	end
+	local objText = prompt.ObjectText or ""
+	local actText = prompt.ActionText or ""
+	local parentName = prompt.Parent and prompt.Parent.Name or ""
+	
+	local combined = (objText .. " " .. actText .. " " .. parentName):lower()
+	if combined:find("toy box") or combined:find("toybox") or combined:find("view pack") or combined:find("toy box pack") then
+		return true
+	end
+	return false
+end
+
+local function isPromptValid(prompt, part)
+	if not prompt or not prompt.Parent then
+		return false
+	end
+	if not prompt.Enabled then
+		return false
+	end
+	if isToyBoxPack(prompt) then
+		return false
+	end
+	if not prompt:IsDescendantOf(workspace) then
+		return false
+	end
+	if not part or not part:IsDescendantOf(workspace) then
+		return false
+	end
+	if part.Position.Y < CONFIG.VoidY then
+		return false
+	end
+	return true
+end
+
+local function groundAt(x, z, originY)
+	local char = LocalPlayer.Character
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = { char }
+	local hit = workspace:Raycast(Vector3.new(x, originY, z), Vector3.new(0, -80, 0), params)
+	return hit and hit.Position.Y or nil
+end
+
+local function isBlockedAt(pos, targetPart)
+	local char = LocalPlayer.Character
+	local op = OverlapParams.new()
+	op.FilterType = Enum.RaycastFilterType.Exclude
+	op.FilterDescendantsInstances = { char }
+	local parts = workspace:GetPartBoundsInBox(
+		CFrame.new(pos + Vector3.new(0, 1.5, 0)),
+		Vector3.new(1.8, 4, 1.8),
+		op
+	)
+	for _, p in ipairs(parts) do
+		if p ~= targetPart and p.CanCollide and p.Transparency < 0.9 then
+			return true
+		end
+	end
+	return false
+end
+
+local function hasLineOfSight(fromPos, prompt, part)
+	if not prompt.RequiresLineOfSight then
+		return true
+	end
+	local char = LocalPlayer.Character
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = { char }
+	local dir = part.Position - fromPos
+	local hit = workspace:Raycast(fromPos, dir, params)
+	if not hit then
+		return true
+	end
+	if hit.Instance == part then
+		return true
+	end
+	local container = part.Parent
+	if container and container ~= workspace and hit.Instance:IsDescendantOf(container) then
+		return true
+	end
+	return false
+end
+
+local function isGoodStand(pos, prompt, part)
+	local maxD = getActivationRange(prompt) - 0.8
+	local gy = groundAt(pos.X, pos.Z, part.Position.Y + 10)
+	if not gy or gy < CONFIG.VoidY then
+		return nil
+	end
+	local standPos = Vector3.new(pos.X, gy + 3, pos.Z)
+	if (standPos - part.Position).Magnitude > maxD then
+		return nil
+	end
+	if isBlockedAt(standPos, part) then
+		return nil
+	end
+	if not hasLineOfSight(standPos + Vector3.new(0, 1.5, 0), prompt, part) then
+		return nil
+	end
+	return standPos
+end
+
+local function findStandCF(prompt, part, root)
+	local maxD = getActivationRange(prompt) - 0.8
+	local toRoot = Vector3.new(root.Position.X - part.Position.X, 0, root.Position.Z - part.Position.Z)
+	local baseAngle = 0
+	if toRoot.Magnitude > 0.1 then
+		baseAngle = math.atan2(toRoot.X, toRoot.Z)
+	end
+
+	local radii = {
+		math.min(CONFIG.StandOff, maxD),
+		math.max(1.2, maxD * 0.5),
+		math.max(1.2, maxD * 0.8),
+	}
+	local offsets = { 0, 30, -30, 60, -60, 90, -90, 120, -120, 150, -150, 180 }
+
+	for _, r in ipairs(radii) do
+		for _, deg in ipairs(offsets) do
+			local a = baseAngle + math.rad(deg)
+			local pos = Vector3.new(
+				part.Position.X + math.sin(a) * r,
+				part.Position.Y,
+				part.Position.Z + math.cos(a) * r
+			)
+			local standPos = isGoodStand(pos, prompt, part)
+			if standPos then
+				return CFrame.lookAt(standPos, Vector3.new(part.Position.X, standPos.Y, part.Position.Z))
+			end
+		end
+	end
+	return nil
+end
+
+local function canInteract(root, prompt, part)
+	if not root or not isPromptValid(prompt, part) then
+		return false
+	end
+	local dist = (root.Position - part.Position).Magnitude
+	if dist > getActivationRange(prompt) + 1 then
+		return false
+	end
+	return hasLineOfSight(root.Position + Vector3.new(0, 1.5, 0), prompt, part)
+end
+
+local function computeCameraCF(head, focus)
+	local char = LocalPlayer.Character
+	local toFocus = focus - head.Position
+	local flatDir = Vector3.new(toFocus.X, 0, toFocus.Z)
+	if flatDir.Magnitude < 0.1 then
+		flatDir = head.CFrame.LookVector * Vector3.new(1, 0, 1)
+	end
+	local back = -flatDir.Unit
+
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = { char }
+	params.IgnoreWater = true
+
+	local origin = head.Position + Vector3.new(0, CONFIG.CamHeight, 0)
+	local desired = origin + back * CONFIG.CamDistance
+	local hit = workspace:Raycast(origin, desired - origin, params)
+
+	local camPos
+	if hit then
+		local dist = math.max(hit.Distance - 0.6, CONFIG.CamMinDistance)
+		camPos = origin + back * dist
+	else
+		camPos = desired
+	end
+
+	return CFrame.lookAt(camPos, focus)
+end
+
+local function lockCamera()
+	if state.camLocked then
+		return
+	end
+	state.camLocked = true
+	local cam = workspace.CurrentCamera
+	if cam then
+		cam.CameraType = Enum.CameraType.Scriptable
+	end
+	RunService:BindToRenderStep(CAM_BIND, Enum.RenderPriority.Camera.Value + 1, function()
+		if not state.running then
+			return
+		end
+		local char = LocalPlayer.Character
+		local head = char and char:FindFirstChild("Head")
+		local root = char and char:FindFirstChild("HumanoidRootPart")
+		local currentCam = workspace.CurrentCamera
+		if not head or not root or not currentCam then
+			return
+		end
+		if currentCam.CameraType ~= Enum.CameraType.Scriptable then
+			currentCam.CameraType = Enum.CameraType.Scriptable
+		end
+		local focus = state.focusPos or (root.Position + root.CFrame.LookVector * 10)
+		currentCam.CFrame = computeCameraCF(head, focus)
+	end)
+end
+
+local function unlockCamera()
+	if not state.camLocked then
+		return
+	end
+	state.camLocked = false
+	pcall(function()
+		RunService:UnbindFromRenderStep(CAM_BIND)
+	end)
+	pcall(function()
+		local cam = workspace.CurrentCamera
+		local _, hum = getCharacterParts()
+		cam.CameraType = Enum.CameraType.Custom
+		if hum then
+			cam.CameraSubject = hum
+		end
+	end)
+end
+
+local function unstick()
+	local root, hum = getCharacterParts()
+	if not root or not hum then
+		return
+	end
+	hum:ChangeState(Enum.HumanoidStateType.Jumping)
+	root.AssemblyLinearVelocity = Vector3.zero
+	root.AssemblyAngularVelocity = Vector3.zero
+	root.CFrame = root.CFrame + Vector3.new(0, 4, 0)
+	task.wait(0.3)
+end
+
+local function setHoldE(down)
+	if state.holdingE == down then
+		return
+	end
+	state.holdingE = down
+	pcall(function()
+		VirtualInputManager:SendKeyEvent(down, Enum.KeyCode.E, false, game)
+	end)
+end
+
+local function travelTo(targetCF)
+	local root, hum = getCharacterParts()
+	if not root or not hum or hum.Health <= 0 then
+		return false
+	end
+
+	local startPos = root.Position
+	local goal = targetCF.Position
+	local total = (goal - startPos).Magnitude
+
+	if total < 0.5 then
+		root.CFrame = targetCF
+		return true
+	end
+
+	local speed = math.max(CONFIG.TravelSpeed, 15)
+	local arcH = total > CONFIG.ShortDistance and CONFIG.ArcHeight or 0
+	local traveled = 0
+	local stuck = 0
+	local lastDesired = nil
+
+	while state.running and traveled < total do
+		local dt = math.min(RunService.Heartbeat:Wait(), 0.1)
+
+		root, hum = getCharacterParts()
+		if not root or not hum or hum.Health <= 0 then
+			return false
+		end
+
+		if lastDesired then
+			if (root.Position - lastDesired).Magnitude > 2.5 then
+				stuck += 1
+				if stuck >= CONFIG.MaxStuckFrames then
+					return false
+				end
+			else
+				stuck = 0
+			end
+		end
+
+		traveled = math.min(total, traveled + speed * dt)
+		local alpha = traveled / total
+		local pos = startPos:Lerp(goal, alpha)
+		pos = pos + Vector3.new(0, math.sin(alpha * math.pi) * arcH, 0)
+
+		root.AssemblyLinearVelocity = Vector3.zero
+		root.AssemblyAngularVelocity = Vector3.zero
+		root.CFrame = CFrame.new(pos)
+		lastDesired = pos
+	end
+
+	if not state.running then
+		return false
+	end
+
+	root, hum = getCharacterParts()
+	if not root or not hum then
+		return false
+	end
+
+	for _ = 1, 4 do
+		root.AssemblyLinearVelocity = Vector3.zero
+		root.AssemblyAngularVelocity = Vector3.zero
+		root.CFrame = targetCF
+		RunService.Heartbeat:Wait()
+	end
+
+	root = getCharacterParts()
+	if not root then
+		return false
+	end
+	return (root.Position - targetCF.Position).Magnitude < 5
+end
+
+local function findTarget(root)
+	local best, bestPart, bestDist = nil, nil, math.huge
+	local now = os.clock()
+
+	for _, obj in ipairs(workspace:GetDescendants()) do
+		if obj:IsA("ProximityPrompt") then
+			local part = resolvePart(obj)
+			if isPromptValid(obj, part) then
+				local last = state.blacklist[obj]
+				local usable = (not last) or (now - last > CONFIG.BlacklistTime)
+				if usable then
+					local dist = (part.Position - root.Position).Magnitude
+					if dist <= CONFIG.Range and dist < bestDist then
+						best, bestPart, bestDist = obj, part, dist
+					end
+				end
+			end
+		end
+	end
+
+	return best, bestPart
+end
+
+local function holdEFor(duration, prompt, part)
+	setHoldE(true)
+	local start = os.clock()
+	while state.running and os.clock() - start < duration do
+		if not (prompt.Parent and prompt.Enabled) then
+			break
+		end
+		state.focusPos = part.Position
+		task.wait(0.1)
+	end
+	setHoldE(false)
+end
+
+local function farmLoop()
+	while state.running do
+		local root, hum = getCharacterParts()
+		if not root or not hum or hum.Health <= 0 then
+			task.wait(1)
+			continue
+		end
+
+		local prompt, part = findTarget(root)
+		if not prompt then
+			state.focusPos = nil
+			task.wait(1)
+			continue
+		end
+
+		state.blacklist[prompt] = os.clock()
+		state.focusPos = part.Position
+
+		local arrived = false
+		for _ = 1, 2 do
+			if not state.running then
+				break
+			end
+			local r = getCharacterParts()
+			if not r then
+				break
+			end
+			local standCF = findStandCF(prompt, part, r)
+			if not standCF then
+				break
+			end
+			if travelTo(standCF) then
+				arrived = true
+				break
+			end
+			unstick()
+		end
+
+		if not arrived or not state.running then
+			state.focusPos = nil
+			task.wait(CONFIG.Cooldown)
+			continue
+		end
+
+		task.wait(CONFIG.ArriveWait)
+		if not state.running then
+			break
+		end
+
+		state.focusPos = part.Position
+
+		root = getCharacterParts()
+		if root and not canInteract(root, prompt, part) then
+			unstick()
+			local standCF = findStandCF(prompt, part, root)
+			if standCF then
+				travelTo(standCF)
+				task.wait(CONFIG.ArriveWait)
+			end
+			root = getCharacterParts()
+		end
+
+		if not root or not state.running or not canInteract(root, prompt, part) then
+			task.wait(CONFIG.Cooldown)
+			continue
+		end
+
+		holdEFor(CONFIG.HoldTime, prompt, part)
+
+		if state.running and prompt.Parent and prompt.Enabled and fireproximityprompt then
+			pcall(fireproximityprompt, prompt)
+		end
+
+		setHoldE(false)
+		state.focusPos = nil
+		task.wait(CONFIG.Cooldown)
+	end
+
+	setHoldE(false)
+	state.focusPos = nil
+end
+
+local function restoreZoom()
+	if state.origMinZoom then
+		pcall(function()
+			LocalPlayer.CameraMinZoomDistance = state.origMinZoom
+		end)
+		state.origMinZoom = nil
+	end
+end
+
+local function findLowServer()
+	local best, bestCount = nil, math.huge
+	local cursor = nil
+
+	for _ = 1, 4 do
+		local url = ("https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Asc&limit=100"):format(game.PlaceId)
+		if cursor then
+			url = url .. "&cursor=" .. cursor
+		end
+
+		local ok, body = pcall(function()
+			return game:HttpGet(url)
+		end)
+		if not ok or type(body) ~= "string" then
+			break
+		end
+
+		local okJson, data = pcall(function()
+			return HttpService:JSONDecode(body)
+		end)
+		if not okJson or type(data) ~= "table" or type(data.data) ~= "table" then
+			break
+		end
+
+		for _, s in ipairs(data.data) do
+			if s.id ~= game.JobId
+				and not visitedServers[s.id]
+				and s.playing < s.maxPlayers
+				and s.playing <= CONFIG.MaxServerPlayers
+				and s.playing < bestCount then
+				best, bestCount = s.id, s.playing
+			end
+		end
+
+		if best and bestCount <= 1 then
+			break
+		end
+
+		cursor = data.nextPageCursor
+		if not cursor or cursor == "" then
+			break
+		end
+	end
+
+	return best
+end
+
+local function setFarming(value)
+	if state.running == value then
+		return
+	end
+	state.running = value
+	if value then
+		pcall(function()
+			state.origMinZoom = LocalPlayer.CameraMinZoomDistance
+			LocalPlayer.CameraMinZoomDistance = 0.5
+		end)
+		lockCamera()
+		task.spawn(function()
+			local ok, err = pcall(farmLoop)
+			if not ok then
+				warn("[AutoFarm] " + tostring(err))
+			end
+			state.running = false
+			setHoldE(false)
+			state.focusPos = nil
+			unlockCamera()
+			restoreZoom()
+		end)
+	else
+		setHoldE(false)
+		state.focusPos = nil
+		unlockCamera()
+		restoreZoom()
+	end
+end
+
+local function hopServer(reason)
+	if state.hopping then
+		return
+	end
+	state.hopping = true
+	warn("[AutoFarm] Hop server: " .. tostring(reason))
+
+	if state.running then
+		state.running = false
+		setHoldE(false)
+		pcall(function()
+			if farmToggle then
+				farmToggle:Set(false)
+			end
+		end)
+	end
+
+	local id = findLowServer()
+	if id then
+		visitedServers[id] = true
+		local ok = pcall(function()
+			TeleportService:TeleportToPlaceInstance(game.PlaceId, id, LocalPlayer)
+		end)
+		if not ok then
+			pcall(function()
+				TeleportService:Teleport(game.PlaceId, LocalPlayer)
+			end)
+		end
+	else
+		pcall(function()
+			TeleportService:Teleport(game.PlaceId, LocalPlayer)
+		end)
+	end
+
+	task.wait(8)
+	state.hopping = false
+end
+
+local function isFriend(p)
+	local ok, result = pcall(function()
+		return LocalPlayer:IsFriendsWith(p.UserId)
+	end)
+	return ok and result
+end
+
+local function getThreat()
+	local myRoot = getCharacterParts()
+	if not myRoot then
+		return nil
+	end
+	for _, p in ipairs(Players:GetPlayers()) do
+		if p ~= LocalPlayer and not (CONFIG.IgnoreFriends and isFriend(p)) then
+			local c = p.Character
+			local r = c and c:FindFirstChild("HumanoidRootPart")
+			local h = c and c:FindFirstChildOfClass("Humanoid")
+			if r and h and h.Health > 0 and (r.Position - myRoot.Position).Magnitude <= CONFIG.SafeRange then
+				return p
+			end
+		end
+	end
+	return nil
+end
+
+local function applyInvisible(char)
+	if not char then
+		return
+	end
+	local target = state.invisible and 1 or 0
+	for _, d in ipairs(char:GetDescendants()) do
+		if d:IsA("BasePart") then
+			d.LocalTransparencyModifier = target
+		end
+	end
+	local hum = char:FindFirstChildOfClass("Humanoid")
+	if hum then
+		hum.DisplayDistanceType = state.invisible and Enum.HumanoidDisplayDistanceType.None or Enum.HumanoidDisplayDistanceType.Viewer
+	end
+end
+
+local function updateRangeCircle()
+	if not state.showRange then
+		if rangeVisualPart then
+			rangeVisualPart:Destroy()
+			rangeVisualPart = nil
+		end
+		return
+	end
+
+	local root, _ = getCharacterParts()
+	if not root then
+		if rangeVisualPart then
+			rangeVisualPart.Transparency = 1
+		end
+		return
+	end
+
+	if not rangeVisualPart or not rangeVisualPart.Parent then
+		rangeVisualPart = Instance.new("Part")
+		rangeVisualPart.Name = "RangeVisualizer"
+		rangeVisualPart.Shape = Enum.PartType.Cylinder
+		rangeVisualPart.Anchored = true
+		rangeVisualPart.CanCollide = false
+		rangeVisualPart.CastShadow = false
+		rangeVisualPart.Material = Enum.Material.Neon
+		rangeVisualPart.Color = rangeColor
+		rangeVisualPart.Transparency = 0.5
+		rangeVisualPart.Parent = workspace
+	end
+
+	rangeVisualPart.Color = rangeColor
+	local diameter = CONFIG.Range * 2
+	rangeVisualPart.Size = Vector3.new(0.4, diameter, diameter)
+	rangeVisualPart.CFrame = CFrame.new(root.Position - Vector3.new(0, 2.5, 0)) * CFrame.Angles(0, 0, math.rad(90))
+end
+
+RunService.RenderStepped:Connect(function()
+	if state.showRange then
+		updateRangeCircle()
+	end
+end)
+
+local function setFpsBoost(enabled)
+	state.fpsBoosted = enabled
+	if enabled then
+		pcall(function()
+			Lighting.GlobalShadows = false
+			Lighting.FogEnd = 9e9
+			settings().Rendering.QualityLevel = Enum.QualityLevel.Level01
+			
+			local terrain = workspace:FindFirstChildOfClass("Terrain")
+			if terrain then
+				terrain.WaterWaveSize = 0
+				terrain.WaterWaveSpeed = 0
+				terrain.WaterReflectance = 0
+				terrain.WaterTransparency = 0
+			end
+			
+			for _, v in ipairs(workspace:GetDescendants()) do
+				if v:IsA("ParticleEmitter") or v:IsA("Trail") or v:IsA("Fire") or v:IsA("Smoke") or v:IsA("Sparkles") then
+					v.Enabled = false
+				elseif v:IsA("BasePart") then
+					v.Material = Enum.Material.SmoothPlastic
+					v.Reflectance = 0
+				end
+			end
+		end)
+	else
+		pcall(function()
+			Lighting.GlobalShadows = true
+			settings().Rendering.QualityLevel = Enum.QualityLevel.Automatic
+		end)
+	end
+end
+
+LocalPlayer.CharacterAdded:Connect(function(char)
+	task.wait(0.5)
+	applyInvisible(char)
+	if state.fpsBoosted then
+		setFpsBoost(true)
+	end
+end)
+
+task.spawn(function()
+	while true do
+		task.wait(0.5)
+		if state.running and state.autoHop and not state.hopping then
+			local root, hum = getCharacterParts()
+			if hum and hum.Health > 0 and hum.Health <= hum.MaxHealth * CONFIG.HopHealth then
+				hopServer("máu thấp")
+			else
+				local threat = getThreat()
+				if threat then
+					hopServer("có người gần: " .. threat.Name)
+				end
+			end
+		end
+	end
+end)
+
+task.spawn(function()
+	while true do
+		task.wait(1)
+		if state.invisible then
+			applyInvisible(LocalPlayer.Character)
+		end
+	end
+end)
+
+task.spawn(function()
+	while true do
+		task.wait(CONFIG.AntiAFKInterval)
+		if state.antiAFK then
+			pcall(function()
+				VirtualUser:CaptureController()
+				VirtualUser:ClickButton2(Vector2.new())
+			end)
+		end
+	end
+end)
+
+local function setAntiAFK(on)
+	state.antiAFK = on
+	if on then
+		if not state.idleConn then
+			state.idleConn = LocalPlayer.Idled:Connect(function()
+				pcall(function()
+					VirtualUser:CaptureController()
+					VirtualUser:ClickButton2(Vector2.new())
+				end)
+			end)
+		end
+	else
+		if state.idleConn then
+			state.idleConn:Disconnect()
+			state.idleConn = nil
+		end
+	end
+end
+
+local function findRayfieldGuis()
+	local guis = {}
+	for _, obj in ipairs(CoreGui:GetChildren()) do
+		if obj:IsA("ScreenGui") and obj.Name == "Rayfield" then
+			table.insert(guis, obj)
+		end
+	end
+	if gethui then
+		for _, obj in ipairs(gethui():GetChildren()) do
+			if obj:IsA("ScreenGui") and obj.Name == "Rayfield" then
+				table.insert(guis, obj)
+			end
+		end
+	end
+	return guis
+end
+
+local function setMenuVisible(value)
+	state.menuVisible = value
+	for _, gui in ipairs(findRayfieldGuis()) do
+		gui.Enabled = value
+	end
+end
+
+local Window = Rayfield:CreateWindow({
+	Name = "Auto Farm By mthu cute",
+	LoadingTitle = "Auto Farm mthu",
+	LoadingSubtitle = "nhan E",
+	ConfigurationSaving = { Enabled = false },
+	Discord = { Enabled = false },
+	KeySystem = true,
+	KeySettings = {
+		Title = "Xác Thực Key",
+		Subtitle = "Auto Farm By mthu cute",
+		Note = "Nhập key để sử dụng (Key: mthuv1beta)",
+		FileName = "MthuKeyStore",
+		SaveKey = true,
+		GrabKeyFromSite = false,
+		Key = {"mthuv1beta"}
+	}
+})
+
+local FarmTab = Window:CreateTab("Farm", 4483362458)
+
+farmToggle = FarmTab:CreateToggle({
+	Name = "Auto Farm",
+	CurrentValue = false,
+	Flag = "AutoFarm",
+	Callback = function(value)
+		setFarming(value)
+	end,
+})
+
+FarmTab:CreateToggle({
+	Name = "Hiển thị vòng tròn phạm vi quét",
+	CurrentValue = false,
+	Flag = "ShowRange",
+	Callback = function(value)
+		state.showRange = value
+		if not value and rangeVisualPart then
+			rangeVisualPart:Destroy()
+			rangeVisualPart = nil
+		end
+	end,
+})
+
+FarmTab:CreateColorPicker({
+	Name = "Màu vòng tròn phạm vi",
+	Color = Color3.fromRGB(0, 255, 255),
+	Flag = "RangeColor",
+	Callback = function(value)
+		rangeColor = value
+		if rangeVisualPart then
+			rangeVisualPart.Color = rangeColor
+		end
+	end,
+})
+
+FarmTab:CreateSlider({
+	Name = "Thời gian giữ E",
+	Range = { 1, 15 },
+	Increment = 1,
+	Suffix = "s",
+	CurrentValue = CONFIG.HoldTime,
+	Flag = "HoldTime",
+	Callback = function(value)
+		CONFIG.HoldTime = value
+	end,
+})
+
+FarmTab:CreateSlider({
+	Name = "Phạm vi quét",
+	Range = { 50, 500 },
+	Increment = 10,
+	Suffix = "studs",
+	CurrentValue = CONFIG.Range,
+	Flag = "Range",
+	Callback = function(value)
+		CONFIG.Range = value
+	end,
+})
+
+FarmTab:CreateSlider({
+	Name = "Tốc độ di chuyển",
+	Range = { 15, 120 },
+	Increment = 5,
+	Suffix = "studs/s",
+	CurrentValue = CONFIG.TravelSpeed,
+	Flag = "TravelSpeed",
+	Callback = function(value)
+		CONFIG.TravelSpeed = value
+	end,
+})
+
+FarmTab:CreateSlider({
+	Name = "Khoảng cách camera",
+	Range = { 3, 15 },
+	Increment = 1,
+	Suffix = "studs",
+	CurrentValue = CONFIG.CamDistance,
+	Flag = "CamDistance",
+	Callback = function(value)
+		CONFIG.CamDistance = value
+	end,
+})
+
+local SafetyTab = Window:CreateTab("An toàn", 4483362458)
+
+SafetyTab:CreateToggle({
+	Name = "Tự hop khi có người gần / máu thấp",
+	CurrentValue = true,
+	Flag = "AutoHop",
+	Callback = function(value)
+		state.autoHop = value
+	end,
+})
+
+SafetyTab:CreateToggle({
+	Name = "Tàng hình (ẩn nhân vật với bạn)",
+	CurrentValue = true,
+	Flag = "Invisible",
+	Callback = function(value)
+		state.invisible = value
+		applyInvisible(LocalPlayer.Character)
+	end,
+})
+
+SafetyTab:CreateSlider({
+	Name = "Phạm vi phát hiện người",
+	Range = { 20, 200 },
+	Increment = 5,
+	Suffix = "studs",
+	CurrentValue = CONFIG.SafeRange,
+	Flag = "SafeRange",
+	Callback = function(value)
+		CONFIG.SafeRange = value
+	end,
+})
+
+SafetyTab:CreateSlider({
+	Name = "Hop khi máu dưới",
+	Range = { 10, 90 },
+	Increment = 5,
+	Suffix = "%",
+	CurrentValue = CONFIG.HopHealth * 100,
+	Flag = "HopHealth",
+	Callback = function(value)
+		CONFIG.HopHealth = value / 100
+	end,
+})
+
+SafetyTab:CreateSlider({
+	Name = "Số người tối đa của server",
+	Range = { 1, 12 },
+	Increment = 1,
+	Suffix = "người",
+	CurrentValue = CONFIG.MaxServerPlayers,
+	Flag = "MaxServerPlayers",
+	Callback = function(value)
+		CONFIG.MaxServerPlayers = value
+	end,
+})
+
+SafetyTab:CreateButton({
+	Name = "Hop server ít người ngay",
+	Callback = function()
+		task.spawn(hopServer, "thủ công")
+	end,
+})
+
+local FpsTab = Window:CreateTab("Boost FPS", 4483362458)
+
+FpsTab:CreateToggle({
+	Name = "Bật Tối Ưu / Boost FPS (Giảm Lag)",
+	CurrentValue = false,
+	Flag = "FpsBoost",
+	Callback = function(value)
+		setFpsBoost(value)
+	end,
+})
+
+local MiscTab = Window:CreateTab("Misc", 4483362458)
+
+
+MiscTab:CreateToggle({
+	Name = "Anti Toy Box Pack (Bỏ qua rương Toy Box)",
+	CurrentValue = true,
+	Flag = "AntiToyBox",
+	Callback = function(value)
+		state.antiToyBox = value
+	end,
+})
+
+MiscTab:CreateToggle({
+	Name = "Anti AFK",
+	CurrentValue = true,
+	Flag = "AntiAFK",
+	Callback = function(value)
+		setAntiAFK(value)
+	end,
+})
+
+setAntiAFK(state.antiAFK)
+
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+	if gameProcessed then
+		return
+	end
+	if input.KeyCode == CONFIG.MenuKey then
+		setMenuVisible(not state.menuVisible)
+	end
+end)
+
+task.defer(function()
+	task.wait(1)
+	setMenuVisible(true)
+end)
+
+applyInvisible(LocalPlayer.Character)
